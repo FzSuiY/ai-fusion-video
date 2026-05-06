@@ -59,27 +59,27 @@ export const STORAGE_TYPE_LABELS: Record<string, string> = {
 
 export const storageConfigApi = {
   async create(data: StorageConfigSaveReq): Promise<number> {
-    return http.post("/storage/config/create", data);
+    return http.post("/api/storage/config/create", data);
   },
 
   async update(data: StorageConfigSaveReq): Promise<boolean> {
-    return http.put("/storage/config/update", data);
+    return http.put("/api/storage/config/update", data);
   },
 
   async delete(id: number): Promise<boolean> {
-    return http.delete("/storage/config/delete", { params: { id } });
+    return http.delete("/api/storage/config/delete", { params: { id } });
   },
 
   async get(id: number): Promise<StorageConfig> {
-    return http.get("/storage/config/get", { params: { id } });
+    return http.get("/api/storage/config/get", { params: { id } });
   },
 
   async list(): Promise<StorageConfig[]> {
-    return http.get("/storage/config/list");
+    return http.get("/api/storage/config/list");
   },
 
   async setDefault(id: number): Promise<boolean> {
-    return http.put("/storage/config/set-default", null, { params: { id } });
+    return http.put("/api/storage/config/set-default", null, { params: { id } });
   },
 };
 
