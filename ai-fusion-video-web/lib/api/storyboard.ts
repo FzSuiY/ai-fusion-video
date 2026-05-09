@@ -238,7 +238,7 @@ export const storyboardApi = {
 
   /** 提交本集合成视频任务（异步） */
   composeEpisodeVideo: (episodeId: number) =>
-    http.post<never, boolean>(`/api/storyboard/episode/${episodeId}/compose-video`),
+    http.post<never, string>(`/api/storyboard/episode/${episodeId}/compose-video`),
 
   // ========== 分镜场次 ==========
 

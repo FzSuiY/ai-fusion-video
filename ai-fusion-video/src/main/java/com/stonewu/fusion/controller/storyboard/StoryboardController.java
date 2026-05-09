@@ -25,6 +25,8 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 
+import static com.stonewu.fusion.security.SecurityUtils.requireCurrentUserId;
+
 /**
  * 分镜脚本 Controller
  */
@@ -109,9 +111,9 @@ public class StoryboardController {
 
     @Operation(summary = "提交本集合成视频任务（异步）")
     @PostMapping("/episode/{id}/compose-video")
-    public CommonResult<Boolean> composeEpisodeVideo(@PathVariable Long id) {
-        videoComposeService.submitCompose(id);
-        return CommonResult.success(true);
+    public CommonResult<String> composeEpisodeVideo(@PathVariable Long id) {
+        Long userId = requireCurrentUserId();
+        return CommonResult.success(videoComposeService.submitCompose(id, userId));
     }
 
     // ========== 分镜场次 ==========

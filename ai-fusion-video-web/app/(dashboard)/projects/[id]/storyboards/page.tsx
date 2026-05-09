@@ -56,10 +56,9 @@ export default function StoryboardTabPage() {
   const { project } = useProject();
   const {
     addPipeline,
+    attachTaskStream,
     setPanelExpanded,
     setExpandedTaskId,
-    addSimpleTask,
-    markSimpleTask,
     setNotificationOpen,
   } = usePipelineStore();
 
@@ -114,8 +113,8 @@ export default function StoryboardTabPage() {
   // 当前选中集的合成状态
   const [currentEpisode, setCurrentEpisode] = useState<StoryboardEpisode | null>(null);
   const [composedPreviewUrl, setComposedPreviewUrl] = useState<string | null>(null);
-  // 跟踪当前活跃的合成任务在通知中心的 ID（按 episodeId 索引）
-  const composeTaskIdsRef = useRef<Map<number, string>>(new Map());
+  const [runningComposeEpisodeIds, setRunningComposeEpisodeIds] = useState<number[]>([]);
+  const [submittingComposeEpisodeIds, setSubmittingComposeEpisodeIds] = useState<number[]>([]);
 
   // 滚动定位 refs
   const sceneRefs = useRef<Record<number, HTMLDivElement | null>>({});
@@ -336,7 +335,7 @@ export default function StoryboardTabPage() {
     );
 
     // 观察所有场次元素
-    for (const [, el] of Object.entries(sceneRefs.current)) {
+    for (const el of Object.values(sceneRefs.current) as Array<HTMLDivElement | null>) {
       if (el) observer.observe(el);
     }
 
@@ -503,79 +502,62 @@ export default function StoryboardTabPage() {
     refreshCurrentEpisode();
   }, [refreshCurrentEpisode]);
 
-  // 合成中时每 2s 轮询状态
-  useEffect(() => {
-    if (currentEpisode?.composeStatus !== 1) return;
-    const id = setInterval(refreshCurrentEpisode, 2000);
-    return () => clearInterval(id);
-  }, [currentEpisode?.composeStatus, refreshCurrentEpisode]);
-
-  // 监听 episode 状态变化，把进度同步到通知中心任务
-  useEffect(() => {
-    const ep = currentEpisode;
-    if (!ep) return;
-    const taskId = composeTaskIdsRef.current.get(ep.id);
-    if (!taskId) return;
-    if (ep.composeStatus === 2) {
-      const url = ep.composedVideoUrl || "";
-      markSimpleTask(taskId, {
-        status: "done",
-        resultText: url
-          ? `✓ 合成完成 · 视频地址：${url}`
-          : "✓ 合成完成",
-      });
-      composeTaskIdsRef.current.delete(ep.id);
-      // 合成完成自动弹出视频预览
-      if (url) {
-        setComposedPreviewUrl(url);
-      }
-    } else if (ep.composeStatus === 3) {
-      markSimpleTask(taskId, {
-        status: "error",
-        errorText: ep.composeErrorMsg || "合成失败",
-      });
-      composeTaskIdsRef.current.delete(ep.id);
-    }
-  }, [
-    currentEpisode,
-    markSimpleTask,
-  ]);
-
   /** 提交本集合成视频任务 */
   const handleComposeEpisodeVideo = useCallback(async () => {
     if (!currentEpisodeId || !currentEpisode) return;
+    if (
+      submittingComposeEpisodeIds.includes(currentEpisodeId) ||
+      runningComposeEpisodeIds.includes(currentEpisodeId) ||
+      currentEpisode.composeStatus === 1
+    ) {
+      return;
+    }
+
     const epLabel = currentEpisode.title?.trim()
       || (currentEpisode.episodeNumber != null ? `第 ${currentEpisode.episodeNumber} 集` : `集 ${currentEpisode.id}`);
-    const taskId = addSimpleTask({
-      label: `合成本集视频：${epLabel}`,
-      projectId,
-      initialNote: "已提交合成任务，正在拼接镜头视频…",
-    });
-    composeTaskIdsRef.current.set(currentEpisodeId, taskId);
+    setSubmittingComposeEpisodeIds((prev) =>
+      prev.includes(currentEpisodeId) ? prev : [...prev, currentEpisodeId]
+    );
     setNotificationOpen(true);
     try {
-      await storyboardApi.composeEpisodeVideo(currentEpisodeId);
-      // 乐观切到 running，触发轮询
-      setCurrentEpisode((prev) =>
-        prev
-          ? { ...prev, composeStatus: 1, composeErrorMsg: null }
-          : prev
+      const taskId = await storyboardApi.composeEpisodeVideo(currentEpisodeId);
+      setSubmittingComposeEpisodeIds((prev) =>
+        prev.filter((id) => id !== currentEpisodeId)
       );
-      // 立即触发一次拉取（合成可能很快完成，避免等满 2s）
-      setTimeout(() => {
-        refreshCurrentEpisode();
-      }, 800);
+      setRunningComposeEpisodeIds((prev) =>
+        prev.includes(currentEpisodeId) ? prev : [...prev, currentEpisodeId]
+      );
+
+      attachTaskStream({
+        label: `合成本集视频：${epLabel}`,
+        projectId,
+        taskId,
+        cancellable: false,
+        onSettled: () => {
+          setRunningComposeEpisodeIds((prev) =>
+            prev.filter((id) => id !== currentEpisodeId)
+          );
+          void refreshCurrentEpisode();
+        },
+      });
+
+      void refreshCurrentEpisode();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "提交合成任务失败";
-      markSimpleTask(taskId, { status: "error", errorText: msg });
-      composeTaskIdsRef.current.delete(currentEpisodeId);
+      console.error("提交合成任务失败:", err);
+      setSubmittingComposeEpisodeIds((prev) =>
+        prev.filter((id) => id !== currentEpisodeId)
+      );
+      setRunningComposeEpisodeIds((prev) =>
+        prev.filter((id) => id !== currentEpisodeId)
+      );
     }
   }, [
     currentEpisodeId,
     currentEpisode,
+    submittingComposeEpisodeIds,
+    runningComposeEpisodeIds,
     projectId,
-    addSimpleTask,
-    markSimpleTask,
+    attachTaskStream,
     setNotificationOpen,
     refreshCurrentEpisode,
   ]);
@@ -743,7 +725,21 @@ export default function StoryboardTabPage() {
             {/* 合成本集视频 */}
             {currentEpisodeId && currentEpisode && (() => {
               const cs = currentEpisode.composeStatus;
-              if (cs === 1) {
+              const isSubmitting = submittingComposeEpisodeIds.includes(currentEpisodeId);
+              const isRunning = runningComposeEpisodeIds.includes(currentEpisodeId) || cs === 1;
+              if (isSubmitting) {
+                return (
+                  <button
+                    disabled
+                    className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border/30 bg-muted/20 text-muted-foreground shrink-0 cursor-not-allowed"
+                    title="正在提交合成任务"
+                  >
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    提交中…
+                  </button>
+                );
+              }
+              if (isRunning) {
                 return (
                   <button
                     disabled

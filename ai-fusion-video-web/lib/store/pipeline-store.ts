@@ -4,12 +4,14 @@ import { create } from "zustand";
 import {
   pipelineStream,
   cancelPipeline,
-  reconnectPipelineStream,
-  getPipelineStatus,
-  listRunningPipelines,
   type AiChatReq,
   type AiChatStreamEvent,
 } from "@/lib/api/ai-pipeline";
+import {
+  reconnectTaskStream,
+  getTaskStreamStatus,
+  listRunningTaskStreams,
+} from "@/lib/api/task-stream";
 
 // ========== 数据失效映射 ==========
 
@@ -80,6 +82,7 @@ export interface PipelineTask {
   status: "running" | "done" | "error" | "cancelled";
   state: PipelineState;
   createdAt: number;
+  cancellable?: boolean;
   /** 任务结束时间（done/error/cancelled 时记录） */
   finishedAt?: number;
 }
@@ -104,6 +107,14 @@ interface PipelineStoreState {
     projectId: number;
     request: AiChatReq;
     onComplete?: () => void;
+  }) => string;
+  attachTaskStream: (config: {
+    label: string;
+    projectId: number;
+    taskId: string;
+    cancellable?: boolean;
+    onComplete?: () => void;
+    onSettled?: (status: "done" | "error" | "cancelled") => void;
   }) => string;
   /**
    * 添加一个非 AI 任务（如视频合成），不走 SSE 流。
@@ -151,6 +162,27 @@ function isMainAgentTerminalEvent(event: AiChatStreamEvent): boolean {
 let idCounter = 0;
 function generateId(): string {
   return `pipeline-${Date.now()}-${++idCounter}`;
+}
+
+type ContentMergeMode = "stream" | "paragraph";
+
+function mergeContentText(
+  existingText: string,
+  incomingText: string,
+  mode: ContentMergeMode
+): string {
+  if (!existingText) return incomingText;
+  if (!incomingText) return existingText;
+  if (mode === "stream") {
+    return existingText + incomingText;
+  }
+  if (existingText.endsWith("\n\n")) {
+    return existingText + incomingText;
+  }
+  if (existingText.endsWith("\n")) {
+    return `${existingText}\n${incomingText}`;
+  }
+  return `${existingText}\n\n${incomingText}`;
 }
 
 /**
@@ -296,7 +328,9 @@ function updateLastTimelineReasoningDuration(
 function createEventHandler(
   id: string,
   set: (fn: (s: PipelineStoreState) => Partial<PipelineStoreState>) => void,
-  onComplete?: () => void
+  onComplete?: () => void,
+  onSettled?: (status: "done" | "error" | "cancelled") => void,
+  contentMergeMode: ContentMergeMode = "stream"
 ) {
   // 事件队列 + rAF 节流，避免高频 set() 导致 Maximum update depth exceeded
   const eventQueue: AiChatStreamEvent[] = [];
@@ -358,6 +392,7 @@ function createEventHandler(
                 );
               }
               if (event.content) {
+                const content = event.content;
                 if (isSubAgent) {
                   next.timeline = appendToToolChildren(
                     next.timeline,
@@ -376,12 +411,19 @@ function createEventHandler(
                       if (last && last.type === "content") {
                         return [
                           ...updatedChildren.slice(0, -1),
-                          { ...last, text: last.text + event.content },
+                          {
+                            ...last,
+                            text: mergeContentText(
+                              last.text,
+                              content,
+                              contentMergeMode
+                            ),
+                          },
                         ];
                       }
                       return [
                         ...updatedChildren,
-                        { type: "content" as const, text: event.content! },
+                        { type: "content" as const, text: content },
                       ];
                     }
                   );
@@ -390,12 +432,16 @@ function createEventHandler(
                   if (last && last.type === "content") {
                     next.timeline[next.timeline.length - 1] = {
                       ...last,
-                      text: last.text + event.content,
+                      text: mergeContentText(
+                        last.text,
+                        content,
+                        contentMergeMode
+                      ),
                     };
                   } else {
                     next.timeline.push({
                       type: "content",
-                      text: event.content,
+                      text: content,
                     });
                   }
                 }
@@ -524,7 +570,11 @@ function createEventHandler(
                 if (last && last.type === "content") {
                   next.timeline[next.timeline.length - 1] = {
                     ...last,
-                    text: last.text + event.content,
+                    text: mergeContentText(
+                      last.text,
+                      event.content,
+                      contentMergeMode
+                    ),
                   };
                 } else {
                   next.timeline.push({ type: "content", text: event.content });
@@ -546,14 +596,14 @@ function createEventHandler(
                     ...children,
                     {
                       type: "content" as const,
-                      text: `❌ ${event.agentName || "子Agent"} 出错: ${event.error || "未知错误"}`,
+                        text: `${event.agentName || "子Agent"} 出错：${event.error || "未知错误"}`,
                     },
                   ]
                 );
               } else if (event.agentName) {
                 next.timeline.push({
                   type: "content",
-                  text: `❌ ${event.agentName} 出错: ${event.error || "未知错误"}`,
+                  text: `${event.agentName} 出错：${event.error || "未知错误"}`,
                 });
               } else {
                 next.status = "error";
@@ -601,12 +651,16 @@ function createEventHandler(
       if (event.outputType === "DONE" && isMainAgentTerminalEvent(event)) {
         abortControllers.delete(id);
         onComplete?.();
+        onSettled?.("done");
       }
       if (
         (event.outputType === "ERROR" || event.outputType === "CANCELLED") &&
         isMainAgentTerminalEvent(event)
       ) {
         abortControllers.delete(id);
+        onSettled?.(
+          event.outputType === "CANCELLED" ? "cancelled" : "error"
+        );
       }
     }
   }
@@ -622,6 +676,46 @@ function createEventHandler(
       }
     }
   };
+}
+
+function settleTaskIfRunning(
+  set: (fn: (s: PipelineStoreState) => Partial<PipelineStoreState>) => void,
+  id: string,
+  status: "done" | "error" | "cancelled",
+  options?: {
+    error?: string;
+    onComplete?: () => void;
+    onSettled?: (status: "done" | "error" | "cancelled") => void;
+  }
+) {
+  let transitioned = false;
+  set((s) => ({
+    tasks: s.tasks.map((t) => {
+      if (t.id !== id || t.status !== "running") {
+        return t;
+      }
+      transitioned = true;
+      return {
+        ...t,
+        status,
+        finishedAt: Date.now(),
+        state: {
+          ...t.state,
+          status,
+          ...(status === "error"
+            ? { error: options?.error || t.state.error || "任务失败" }
+            : {}),
+        },
+      };
+    }),
+  }));
+  abortControllers.delete(id);
+  if (transitioned) {
+    if (status === "done") {
+      options?.onComplete?.();
+    }
+    options?.onSettled?.(status);
+  }
 }
 
 export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
@@ -646,6 +740,7 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
       status: "running",
       state: initialState,
       createdAt: Date.now(),
+      cancellable: false,
     };
     set((s) => ({ tasks: [...s.tasks, task] }));
     if (onComplete) {
@@ -706,6 +801,7 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
       status: "running",
       state: initialState,
       createdAt: Date.now(),
+      cancellable: true,
     };
 
     set((s) => ({ tasks: [...s.tasks, task] }));
@@ -759,6 +855,93 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
     return id;
   },
 
+  attachTaskStream: ({
+    label,
+    projectId,
+    taskId,
+    cancellable = false,
+    onComplete,
+    onSettled,
+  }) => {
+    const id = generateId();
+    const task: PipelineTask = {
+      id,
+      label,
+      projectId,
+      status: "running",
+      state: {
+        status: "running",
+        reasoningText: "",
+        timeline: [{ type: "content", text: "正在连接任务流……" }],
+        conversationId: taskId,
+      },
+      createdAt: Date.now(),
+      cancellable,
+    };
+
+    set((s) => ({ tasks: [...s.tasks, task] }));
+
+    void (async () => {
+      try {
+        const streamStatus = await getTaskStreamStatus(taskId);
+        if (streamStatus === "NONE") {
+          settleTaskIfRunning(set, id, "error", {
+            error: "任务流不存在",
+            onSettled,
+          });
+          return;
+        }
+
+        const handleEvent = createEventHandler(
+          id,
+          set,
+          onComplete,
+          onSettled,
+          "paragraph"
+        );
+
+        set((s) => ({
+          tasks: s.tasks.map((t) =>
+            t.id === id
+              ? { ...t, state: { ...t.state, timeline: [] } }
+              : t
+          ),
+        }));
+
+        const controller = reconnectTaskStream(taskId, {
+          onEvent: handleEvent,
+          onError: (err) => {
+            settleTaskIfRunning(set, id, "error", {
+              error: err.message,
+              onSettled,
+            });
+          },
+          onComplete: () => {
+            const fallbackStatus =
+              streamStatus === "ERROR"
+                ? "error"
+                : streamStatus === "COMPLETED"
+                  ? "done"
+                  : "done";
+            settleTaskIfRunning(set, id, fallbackStatus, {
+              onComplete,
+              onSettled,
+            });
+          },
+        });
+
+        abortControllers.set(id, controller);
+      } catch (err) {
+        settleTaskIfRunning(set, id, "error", {
+          error: err instanceof Error ? err.message : "连接任务流失败",
+          onSettled,
+        });
+      }
+    })();
+
+    return id;
+  },
+
   cancelPipeline: async (id: string) => {
     const task = get().tasks.find((t) => t.id === id);
     const controller = abortControllers.get(id);
@@ -792,6 +975,7 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
   removePipeline: (id: string) => {
     abortControllers.get(id)?.abort();
     abortControllers.delete(id);
+    simpleTaskCallbacks.delete(id);
     set((s) => ({
       tasks: s.tasks.filter((t) => t.id !== id),
       expandedTaskId: s.expandedTaskId === id ? null : s.expandedTaskId,
@@ -799,6 +983,13 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
   },
 
   clearCompleted: () => {
+    const removableIds = get().tasks
+      .filter((t) => t.status !== "running")
+      .map((t) => t.id);
+    for (const id of removableIds) {
+      abortControllers.delete(id);
+      simpleTaskCallbacks.delete(id);
+    }
     set((s) => ({
       tasks: s.tasks.filter((t) => t.status === "running"),
       expandedTaskId:
@@ -835,7 +1026,7 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
     // 异步查询后端
     (async () => {
       try {
-        const runningConvs = await listRunningPipelines();
+        const runningConvs = await listRunningTaskStreams();
         if (runningConvs.length === 0) {
           console.log("[Pipeline] 无运行中任务");
           return;
@@ -870,20 +1061,27 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
             createdAt: conv.createTime
               ? new Date(conv.createTime).getTime()
               : Date.now(),
+            cancellable: conv.category !== "task",
           };
 
           set((s) => ({ tasks: [...s.tasks, placeholder] }));
 
           // 检查 Redis 流状态
           try {
-            const streamStatus = await getPipelineStatus(conversationId);
+            const streamStatus = await getTaskStreamStatus(conversationId);
             console.log(
               `[Pipeline] 对话 ${conversationId} Redis 状态: ${streamStatus}`
             );
 
             if (streamStatus === "ACTIVE") {
               // 后台仍在运行 → 重连 SSE
-              const handleEvent = createEventHandler(id, set);
+              const handleEvent = createEventHandler(
+                id,
+                set,
+                undefined,
+                undefined,
+                conv.category === "task" ? "paragraph" : "stream"
+              );
 
               // 清空占位文本
               set((s) => ({
@@ -894,39 +1092,13 @@ export const usePipelineStore = create<PipelineStoreState>()((set, get) => ({
                 ),
               }));
 
-              const controller = reconnectPipelineStream(conversationId, {
+              const controller = reconnectTaskStream(conversationId, {
                 onEvent: handleEvent,
                 onError: (err) => {
-                  set((s) => ({
-                    tasks: s.tasks.map((t) =>
-                      t.id === id
-                        ? {
-                            ...t,
-                            status: "error" as const,
-                            state: {
-                              ...t.state,
-                              status: "error" as const,
-                              error: err.message,
-                            },
-                          }
-                        : t
-                    ),
-                  }));
-                  abortControllers.delete(id);
+                  settleTaskIfRunning(set, id, "error", { error: err.message });
                 },
                 onComplete: () => {
-                  set((s) => ({
-                    tasks: s.tasks.map((t) =>
-                      t.id === id && t.status === "running"
-                        ? {
-                            ...t,
-                            status: "done" as const,
-                            state: { ...t.state, status: "done" as const },
-                          }
-                        : t
-                    ),
-                  }));
-                  abortControllers.delete(id);
+                  settleTaskIfRunning(set, id, "done");
                 },
               });
 
